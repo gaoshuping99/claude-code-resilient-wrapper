@@ -1,5 +1,8 @@
 # claude-code-resilient-wrapper
 
+[![CI](https://github.com/gaoshuping99/claude-code-resilient-wrapper/actions/workflows/ci.yml/badge.svg)](https://github.com/gaoshuping99/claude-code-resilient-wrapper/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 一个用 `expect` 包住 [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 的弹性 wrapper：当 Claude Code 报出 socket 断开 / 网络异常 / 5xx / `overloaded_error` / 429 等可恢复错误时，自动向 PTY 注入「继续」二字，让长任务从断点续上，不需要你手工按键。
 
 适合的场景：让 Claude Code 跑长时间任务（深度搜索、批量改动、workflow 等），中途遇到瞬时 API 抖动还能自动续。
