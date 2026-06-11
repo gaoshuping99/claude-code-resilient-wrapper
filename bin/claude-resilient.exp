@@ -1,0 +1,174 @@
+#!/usr/bin/env expect
+# claude-resilient.exp
+#
+# 启动 Claude Code，并在 socket / 网络 / 5xx / overloaded 错误时自动注入「继续」
+# 让任务从中断处续上。
+#
+# === 怎么知道 wrapper 在工作 ===
+# 出错时屏幕上会打印：
+#   [claude-resilient] 命中 'socket' 错误，匹配片段: ...
+#   [claude-resilient] 第 N 次自动续 (3s 后注入「继续」)
+# 同时事件日志写到 ~/.claude/logs/claude-resilient.log
+#
+# === 用法（一般通过 zsh function `claude` 包装调用） ===
+#     claude            # 通过 .zshrc 的 claude function 走 wrapper
+#     claude -c
+#     ~/path/to/claude-resilient.exp -c   # 直接调（debug 用）
+#
+# === 配置（可选环境变量）===
+#     CLAUDE_BIN=/path/to/claude     # 指定真实 claude 二进制路径（默认从 PATH 探测）
+#     CLAUDE_RESILIENT_TRACE=1       # 开启全量 stdout 镜像（很大）
+#
+# === 应急退出 wrapper ===
+#     unfunction claude              # 当前 shell 临时禁用
+#     command claude                 # 一次性绕过 shell function
+
+set timeout -1
+log_user 1
+
+# ===== 日志（默认开启）=====
+set log_dir [file join $env(HOME) .claude logs]
+file mkdir $log_dir
+set event_log [file join $log_dir claude-resilient.log]
+
+proc dlog {msg} {
+    global event_log
+    set fp [open $event_log a]
+    puts $fp "[clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] $msg"
+    close $fp
+}
+
+# 详细 stdout 镜像（可选，CLAUDE_RESILIENT_TRACE=1 才开；很大）
+if {[info exists env(CLAUDE_RESILIENT_TRACE)] && $env(CLAUDE_RESILIENT_TRACE) eq "1"} {
+    log_file -a [file join $log_dir claude-resilient-trace.log]
+    dlog "trace mode enabled"
+}
+
+# ===== 重试限额（防代理彻底挂时无限重试）=====
+set retry_count 0
+set max_retries 50
+# 同一**种**错误 2 秒内连续命中只算一次（防刷屏）—— 按 kind 分桶，不同 kind 不互相影响
+array set last_trigger_ts {}
+set min_gap_seconds 2
+
+# ===== spawn claude（绝对路径避免 zsh function 递归）=====
+# 优先级：CLAUDE_BIN 环境变量 > PATH 中第一个 claude（排除自身）> 常见 brew 路径
+proc resolve_claude_bin {} {
+    if {[info exists ::env(CLAUDE_BIN)] && $::env(CLAUDE_BIN) ne ""} {
+        return $::env(CLAUDE_BIN)
+    }
+    # 走 `which -a` 找出所有 claude，跳过 wrapper 自身
+    set self [file normalize [info script]]
+    if {[catch {exec which -a claude} all_paths] == 0} {
+        foreach p [split $all_paths "\n"] {
+            set p [string trim $p]
+            if {$p eq "" || $p eq $self} { continue }
+            if {[file executable $p]} { return $p }
+        }
+    }
+    foreach candidate {/opt/homebrew/bin/claude /usr/local/bin/claude} {
+        if {[file executable $candidate]} { return $candidate }
+    }
+    send_user "\[claude-resilient] 找不到 claude 二进制，请设置 CLAUDE_BIN 环境变量\n"
+    exit 127
+}
+set claude_bin [resolve_claude_bin]
+dlog "using claude bin: $claude_bin"
+
+if {[info exists argv]} {
+    eval spawn -noecho $claude_bin $argv
+} else {
+    spawn -noecho $claude_bin
+}
+dlog "spawned claude pid=$spawn_id"
+
+# ===== 触发器 =====
+# kind: 错误大类标签（'socket' / 'network' / '5xx' / 'overload' / 'rate_limit' / 'unknown'）
+# wait_seconds: 注入「继续」前等多久（5xx/overload 多等一会）
+# matched_text: 命中的实际文本（用于日志和屏幕回显）
+proc on_error {kind wait_seconds matched_text} {
+    global retry_count max_retries last_trigger_ts min_gap_seconds
+
+    set now [clock seconds]
+    set prev 0
+    if {[info exists last_trigger_ts($kind)]} {
+        set prev $last_trigger_ts($kind)
+    }
+    if {$now - $prev < $min_gap_seconds} {
+        dlog "ignored duplicate '$kind' within ${min_gap_seconds}s"
+        return
+    }
+    set last_trigger_ts($kind) $now
+
+    incr retry_count
+    if {$retry_count > $max_retries} {
+        send_user "\n\[claude-resilient] 达到最大重试次数 $max_retries，放弃自动续接\n"
+        dlog "give up after $max_retries retries"
+        return
+    }
+
+    # 提取匹配文本片段（最多 120 字符，避免占满屏）
+    set snippet [string range $matched_text 0 119]
+    regsub -all "\[\r\n]" $snippet " " snippet
+
+    send_user "\n\[claude-resilient] 命中 '$kind' 错误，匹配片段: $snippet\n"
+    send_user "\[claude-resilient] 第 $retry_count 次自动续 (${wait_seconds}s 后注入「继续」)\n"
+    dlog "match kind=$kind retry=$retry_count snippet=$snippet"
+
+    sleep $wait_seconds
+    send -- "继续\r"
+    dlog "injected '继续' to PTY"
+}
+
+    # ----- interact 双向透明转发（关键 — 解决单向 expect 的 TUI 协商问题）=====
+# -o 块仅在 spawned→屏幕方向匹配 pattern，不打断正常 IO
+interact {
+    -o
+    # ----- socket / 连接断开类（最常见）-----
+    -re "API Error.*socket connection was closed unexpectedly" {
+        on_error socket 3 $interact_out(0,string)
+    }
+    -re "API Error.*socket hang up" {
+        on_error socket 3 $interact_out(0,string)
+    }
+    -re "API Error.*(Connection (reset|refused|terminated|closed)|ECONNRESET|ECONNREFUSED|ECONNABORTED)" {
+        on_error socket 3 $interact_out(0,string)
+    }
+    # ----- 网络/超时/DNS -----
+    -re "API Error.*(ETIMEDOUT|ESOCKETTIMEDOUT|read ETIMEDOUT)" {
+        on_error network 5 $interact_out(0,string)
+    }
+    -re "API Error.*(EAI_AGAIN|ENOTFOUND|getaddrinfo)" {
+        on_error network 5 $interact_out(0,string)
+    }
+    -re "API Error.*(fetch failed|network error|aborted|TypeError: fetch)" {
+        on_error network 3 $interact_out(0,string)
+    }
+    # ----- 5xx server error -----
+    -re "API Error: 5\[0-9]\[0-9]" {
+        on_error 5xx 5 $interact_out(0,string)
+    }
+    -re "API Error.*(upstream connect error|upstream request timeout|upstream timeout)" {
+        on_error 5xx 5 $interact_out(0,string)
+    }
+    # ----- 显式 overloaded（Anthropic SDK 用语）-----
+    -re "API Error.*(overloaded_error|overloaded|capacity exceeded)" {
+        on_error overload 10 $interact_out(0,string)
+    }
+    # ----- rate limit（429）-----
+    -re "API Error: 429" {
+        on_error rate_limit 30 $interact_out(0,string)
+    }
+    -re "API Error.*rate.?limit" {
+        on_error rate_limit 30 $interact_out(0,string)
+    }
+    # ----- 兜底：任何 API Error 行（最后兜底，避免漏检）-----
+    # 不主动注入「继续」，只记日志，让你下次发现新错误模式后告诉我
+    -re "API Error: \[^\r\n]+" {
+        dlog "uncategorized API Error seen: $interact_out(0,string)"
+    }
+    eof {
+        dlog "claude EOF, wrapper exiting (retries used=$retry_count)"
+        return
+    }
+}

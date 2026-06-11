@@ -1,0 +1,12 @@
+# 日志文件
+*.log
+.claude/logs/
+
+# 临时文件
+*.tmp
+*.swp
+.DS_Store
+
+# 备份
+*.bak
+*.backup-*
