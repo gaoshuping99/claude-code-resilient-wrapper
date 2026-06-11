@@ -126,14 +126,16 @@ command claude      # 一次性绕过 shell function
 
 ## 怎么知道 wrapper 在工作？
 
-**触发时**屏幕上会冒出：
+**触发时**屏幕上**理论上**会冒出黄字：
 
 ```
 [claude-resilient] 命中 'socket' 错误，匹配片段: API Error: socket connection was closed unexpectedly...
 [claude-resilient] 第 1 次自动续 (3s 后注入「继续」)
 ```
 
-**事件日志**：`~/.claude/logs/claude-resilient.log`
+> ⚠️ **实战中这两行你大概率看不见。** Claude Code 是全屏 TUI，每次重绘会立刻把 wrapper 的提示行覆盖掉。**事件日志才是单一可信源**——务必看日志，别看屏幕。
+
+**事件日志**（永远可信）：`~/.claude/logs/claude-resilient.log`
 
 ```
 2026-06-11 10:52:13 spawned claude pid=exp6
@@ -164,6 +166,7 @@ set min_gap_seconds 2         # 同种错误的去重窗口
 
 ## 已知限制
 
+- **触发提示在 TUI 下被吞**：wrapper 的黄字 "[claude-resilient] 命中..." 会被 Claude Code 的全屏重绘立刻覆盖掉，看上去像没触发。**只有 `~/.claude/logs/claude-resilient.log` 是可信的判定依据**。已在"怎么知道 wrapper 在工作"那段提示。
 - **错误识别基于文本匹配**：Claude Code 改了报错措辞就需要更新正则。仓库里的兜底逻辑会把"未识别的 API Error"写日志，方便你回过来补。
 - **注入「继续」是中文**：因为目前我让 Claude 主要用中文工作。如果你用英文，把脚本里 `send -- "继续\r"` 改成 `send -- "continue\r"` 即可。
 - **无法救已经退出的 turn**：如果 Claude Code 自己把 turn 判定为终止（比如 token 用尽），wrapper 没法救，它只能让 stuck 的 turn 续上。
