@@ -67,28 +67,36 @@ jobs:
         #   1. 能成功 spawn
         #   2. 能识别错误模式
         #   3. 注入「继续」后假进程能正常退出
+        # 注意：expect 的 interact 模式要求 stdin 是 TTY，CI runner 默认没有 TTY，
+        # 所以用 util-linux 的 `script -q -c ...` 包一层伪 TTY。
         run: |
           cat > /tmp/fake-claude.sh <<'SH'
           #!/usr/bin/env bash
           echo "fake claude starting"
           sleep 1
           echo "API Error: socket hang up — fake injected for CI"
-          # 等 wrapper 注入「继续」并被 cat 读到
+          # 等 wrapper 注入「继续」并被 read 读到
           read -r line
           echo "fake claude received: $line"
           exit 0
           SH
           chmod +x /tmp/fake-claude.sh
 
-          # 后台跑 wrapper，最多等 30 秒
           export CLAUDE_BIN=/tmp/fake-claude.sh
-          timeout 30 ./bin/claude-resilient.exp 2>&1 | tee /tmp/wrapper-out.log || true
+          # script -q -c CMD FILE 在 PTY 中跑 CMD，输出落到 FILE。
+          # -e 让脚本继承子进程的 exit code（util-linux 2.31+，ubuntu-latest 自带）。
+          timeout 30 script -q -e -c "./bin/claude-resilient.exp" /tmp/wrapper-out.log \
+            || echo "(wrapper exited / timed out, that's fine)"
 
           echo "---- wrapper output ----"
           cat /tmp/wrapper-out.log
 
           echo "---- assertions ----"
+          fail=0
           grep -q "命中 'socket' 错误" /tmp/wrapper-out.log \
-            && echo "✓ 错误模式被正确识别"
+            && echo "✓ 错误模式被正确识别" \
+            || { echo "✗ 错误模式未被识别"; fail=1; }
           grep -q "fake claude received: 继续" /tmp/wrapper-out.log \
-            && echo "✓ 「继续」被正确注入到子进程 stdin"
+            && echo "✓ 「继续」被正确注入到子进程 stdin" \
+            || { echo "✗ 「继续」未被注入"; fail=1; }
+          exit $fail
